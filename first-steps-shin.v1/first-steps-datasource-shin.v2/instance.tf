@@ -1,0 +1,144 @@
+
+# ==========================================================================
+# [AWS 공급자 설정]
+# 인프라를 생성할 대상을 AWS 클라우드로 지정하고, 지리적 위치를 서울 리전으로 설정합니다.
+# ==========================================================================
+provider "aws" {
+  region = "ap-northeast-2" # AWS 한국(서울) 데이터 센터 이용
+}
+
+# ==========================================================================
+# [리소스 1: 가상 서버 생성] AWS EC2 인스턴스
+# [참조 위치] 데이터 소스로 조회한 AMI, 생성된 VPC 공인 서브넷, 보안 그룹, 키 페어 리소스
+# [설정 목적] 외부에서 웹 브라우저나 SSH 터미널로 접속할 수 있는 실물 Linux 서버 구축
+# ==========================================================================
+resource "aws_instance" "web" {
+  # datasource.tf 파일에서 조회한 가장 최신의 공식 우분투 이미지 ID를 주입
+  ami           = data.aws_ami.ubuntu.id
+  # AWS Graviton(ARM64 아키텍처) 기반의 비용 효율적인 가상 머신 사양 선택
+  # ※ 주의: 이 사양을 쓰려면 우분투 이미지(AMI)도 반드시 arm64 규격이어야 합니다.
+  instance_type = "t4g.micro"
+
+  # 명시적으로 퍼블릭 IP를 할당하도록 설정 추가
+  #associate_public_ip_address = true 
+
+  # 미리 선언해 둔 가상 네트워크(VPC 모듈)의 첫 번째 공인(Public) 서브넷에 배치
+  # 모듈 설정에서 map_public_ip_on_launch=true를 켰기 때문에 퍼블릭 IP가 자동 할당됩니다.
+  subnet_id = module.vpc.public_subnets[0]
+
+  # 하단에서 정의할 'allow_ssh' 방화벽(보안 그룹) 규칙을 이 가상 서버에 적용
+  vpc_security_group_ids = [aws_security_group.allow_ssh.id]
+
+  # 하단에서 정의할 'mykey' 인증키의 명칭을 연동하여 서버 원격 접속 권한 부여
+  key_name = aws_key_pair.mykey.key_name 
+
+  #################################
+  # 2026.05.16
+  # user_data 사용한 프로비저닝
+  #################################
+  user_data = templatefile("${path.module}/templates/web.tpl", {
+    "region" = var.aws_region
+    "bucket_name" = var.bucket_name
+  }) 
+  # [설정 목적] user_data(초기화 스크립트) 내용이 수정되면, 기존 인스턴스를 즉시 자동 삭제하고 
+  #  완전히 새 서버로 교체(Replace)하여 배포하도록 강제하는 옵션입니다.
+  # 추천하는 기능임. 코드와 클라우드 실물의 상태 일치를 위해 매우 추천함.
+  user_data_replace_on_change = true
+
+  # ==========================================================================
+  # 비추천 --- user_data 방식 선호 // 실패 시 terraform 상태 파일에서 추적을 못함, 방화벽 이슈
+  # [원격 접속 세션 정의]
+  # 테라폼이 생성된 서버 내부에 들어가 명령어를 실행할 수 있도록 로그인 정보를 세팅합니다.
+  # ==========================================================================
+  #connection {
+  #  type    = "ssh"         # 원격 접속 프로토콜 방식을 SSH로 지정
+  #  user    = "ubuntu"      # 우분투 리눅스의 기본 관리자 계정 이름
+  #  private_key    = file("${path.module}/mykey")
+  #  host    = self.public_ip  # 방금 생성된 EC2 인스턴스의 퍼블릭 IP 주소로 자동 접속
+  #}
+
+  # ==========================================================================
+  # 비추천 --- user_data 방식 선호 // 실패 시 terraform 상태 파일에서 추적을 못함, 방화벽 이슈
+  #  [원격 명령 실행기] provisioner "remote-exec"
+  # [동작 방식] 위의 connection 정보를 바탕으로 서버에 로그인한 뒤, 아래 명령어들을 순차 실행합니다.
+  #  ==========================================================================
+  #provisioner "remote-exec" {
+  #  inline = [
+  #    "sudo apt-get update",
+  #    "sudo apt-get -y install nginx",
+  #  ]
+  #}
+
+
+
+  # 자원 관리 및 식별을 위한 태그 설정 (AWS 콘솔 화면에 'example'로 노출됨)
+  tags = {
+    #Name = "aws-ec2-server"
+    Name = "example"
+  }
+}
+
+# ==========================================================================
+# [리소스 2: 네트워크 방화벽 설정] AWS VPC 보안 그룹 (Security Group)
+# [참조 위치] 가상 네트워크 인프라 (module.vpc)
+# [설정 목적] 외부에서 서버로 들어오는 트래픽과 나가는 트래픽의 포트를 제어하여 보안 강화
+# ==========================================================================
+resource "aws_security_group" "allow_ssh" {
+  name          = "allow_ssh"
+  description   = "Allow SSH inbound traffic and all outbound traffic"
+
+  # 이 방화벽 규칙이 작동할 대상 가상 네트워크(VPC)를 지정
+  #vpc_id        = aws_vpc.main.id
+  vpc_id        = module.vpc.vpc_id
+
+  # 1. 기존 SSH 접속 허용 규칙 (그대로 유지)
+  # [인바운드 규칙] 외부에서 서버 방향으로 들어오는 요청 제어
+  ingress {
+    from_port        = 22
+    to_port          = 22
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]   # 전 세계 모든 IPv4 주소로부터의 22번 포트 접속 허용 (실습용)
+    ipv6_cidr_blocks = ["::/0"]        # 전 세계 모든 IPv6 주소로부터의 22번 포트 접속 허용
+  }
+
+  # 2. [핵심 추가] 웹 브라우저 접속(HTTP)을 위한 80번 포트 개방 규칙
+  #ingress {
+  #  from_port        = 80            # 웹 표준 HTTP 포트 시작
+  #  to_port          = 80            # 웹 표준 HTTP 포트 끝
+  #  protocol         = "tcp"         # TCP 프로토콜 사용
+  #  cidr_blocks      = ["0.0.0.0/0"] # 전 세계 모든 IPv4 대역의 브라우저 접속 허용
+  #  ipv6_cidr_blocks = ["::/0"]      # 전 세계 모든 IPv6 대역 허용
+  #}
+  #ingress {
+  #  from_port        = 443            # 웹 표준 HTTP 포트 시작
+  #  to_port          = 443            # 웹 표준 HTTP 포트 끝
+  #  protocol         = "tcp"         # TCP 프로토콜 사용
+  #  cidr_blocks      = ["0.0.0.0/0"] # 전 세계 모든 IPv4 대역의 브라우저 접속 허용
+  #  ipv6_cidr_blocks = ["::/0"]      # 전 세계 모든 IPv6 대역 허용
+  #}
+
+  # [아웃바운드 규칙] 서버에서 인터넷(외부) 방향으로 나가는 요청 제어
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]   # 전 세계 모든 IPv4 주소로부터의 22번 포트 접속 허용 (실습용)
+    ipv6_cidr_blocks = ["::/0"]        # 전 세계 모든 IPv6 주소로부터의 22번 포트 접속 허용
+  }
+
+  tags = {
+    Name = "allow_ssh"
+  }
+}
+
+# ==========================================================================
+# [리소스 3: 원격 접속 인증키 등록] AWS EC2 키 페어 (Key Pair)
+# [참조 위치] 로컬 컴퓨터 내부의 SSH 공인키 파일 (${path.module}/mykey.pub)
+# [설정 목적] 관리자가 터미널을 통해 Linux 서버에 암호 없이 안전하게 로그인할 수 있도록 보증서 등록
+# ==========================================================================
+resource "aws_key_pair" "mykey" {
+  key_name   = "mykey-demo"     # AWS 관리 콘솔에 등록될 키 페어의 고유 명칭
+
+  # 로컬 작업 디렉터리에 생성해 둔 'mykey.pub'(공개키) 파일의 텍스트 내용을 읽어와 AWS에 업로드
+  public_key = file("${path.module}/mykey.pub")
+}

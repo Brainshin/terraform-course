@@ -1,0 +1,14 @@
+# 1. AWS 공급자 설정 (자격 증명은 내부 키를 연동하고 리전만 서울로 고정합니다)
+provider "aws" {
+  region = "ap-northeast-2"
+}
+
+# 2. Apple Silicon 환경 무료 가상 서버 정의
+resource "aws_instance" "example" {
+  ami           = "ami-04169527f30df0f63" 
+  instance_type = "t4g.micro"             # Graviton2 무료 프리 티어 타입
+
+  tags = {
+    Name = "aws-ec2-server" # 16시 50분 자동 종료 스크립트 연동용 태그
+  }
+}
